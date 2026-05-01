@@ -8,3 +8,4 @@ DerivedData/
 sidecar/node_modules/
 dist/
 build.env
+build-dmg.sh
