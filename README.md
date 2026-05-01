@@ -34,13 +34,15 @@ Every action happens in the foreground, in the app you're looking at. You watch 
 
 ## Install
 
+**Download:** [cue-0.1.dmg](https://github.com/adichaa/cue-oss/releases/latest) — drag to Applications, launch, done.
+
+**Or build from source:**
+
 ```bash
 git clone https://github.com/adichaa/cue-oss
 cd cue-oss
 bash build-app.sh
 ```
-
-Then launch cue from `/Applications`.
 
 On first launch cue will walk you through granting Screen Recording and Accessibility permissions, and prompt for your API key.
 
