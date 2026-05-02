@@ -1,5 +1,7 @@
 # cue
 
+**[adichaurasia.com/cue](https://adichaurasia.com/cue)**
+
 A floating macOS overlay that lets an AI see your screen and guide you through — or fully execute — tasks across any app, step by step, on your real Mac.
 
 > Not a chatbot. Not a sandbox. A visible, watch-every-step AI assistant that sits on your desktop and helps you use the software you already have open.
