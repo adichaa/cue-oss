@@ -8,7 +8,14 @@ A floating macOS overlay that lets an AI see your screen and guide you through �
 
 ## Demo
 
-<!-- TODO: add GIF -->
+**Coach mode** — cue tells you the next step and shows you exactly where to click. You do it, press Enter, repeat.
+[▶ Watch](https://github.com/adichaa/cue-oss/releases/download/v0.1/coach.mov)
+
+**Autonomous mode** — same as Coach but cue executes approved actions automatically.
+[▶ Watch](https://github.com/adichaa/cue-oss/releases/download/v0.1/autonomous.mov)
+
+**Agent mode** — fully headless, runs in the background while you keep working.
+[▶ Watch](https://github.com/adichaa/cue-oss/releases/download/v0.1/agent.mov)
 
 ---
 
