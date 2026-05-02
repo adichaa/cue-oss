@@ -326,7 +326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleOverlay() {
-        if overlay.isVisible {
+        if overlay.isVisible && overlay.isOnActiveSpace {
             overlay.orderOut(nil)
         } else {
             overlay.present()

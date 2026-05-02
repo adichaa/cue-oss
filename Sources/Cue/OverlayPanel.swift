@@ -81,14 +81,17 @@ final class OverlayPanel: NSPanel {
     var cgWindowID: CGWindowID { CGWindowID(windowNumber) }
 
     func present() {
-        guard let screen = NSScreen.main else { return }
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
         let visible = screen.visibleFrame
         let origin = NSPoint(
             x: visible.midX - frame.width / 2,
             y: visible.maxY - frame.height - 24
         )
         setFrameOrigin(origin)
+        level = .floating
         makeKeyAndOrderFront(nil)
+        orderFrontRegardless()
     }
 
     func setRecording(_ recording: Bool) {
