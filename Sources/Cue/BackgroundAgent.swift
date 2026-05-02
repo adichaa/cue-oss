@@ -7,6 +7,8 @@ final class BackgroundAgent {
     private let client: AnthropicClient
     private let sidecar = PlaywrightSidecar()
     private var runTask: Task<Void, Never>?
+    private let logFileHandle: FileHandle?
+    private let logQueue = DispatchQueue(label: "com.cue.bgagent.log")
 
     var onStatusUpdate: ((String) -> Void)?
     var onComplete: ((String) -> Void)?
@@ -15,11 +17,19 @@ final class BackgroundAgent {
     var onSpawnAgent: ((String) async -> String)?
 
     private var conversationMessages: [[String: Any]] = []
+    private var scratchpad: String = ""
     private var finished = false
 
     @MainActor init(task: String, settings: Settings) {
         self.task = task
         self.client = AnthropicClient(settings: settings)
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cue/logs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let file = dir.appendingPathComponent("\(fmt.string(from: Date()))_agent_\(id).log")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        logFileHandle = try? FileHandle(forWritingTo: file)
     }
 
     @MainActor func start() {
@@ -28,7 +38,7 @@ final class BackgroundAgent {
     }
 
     @MainActor func resume(message: String) {
-        CueLogger.write("[bg] follow-up: \(message)")
+        agentLog("[bg] follow-up: \(message)")
         requestNotificationPermission()
         var msgs = conversationMessages
         msgs.append(["role": "assistant", "content": "Ready for your follow-up."])
@@ -46,14 +56,28 @@ final class BackgroundAgent {
 
     // MARK: - Private
 
+    private func agentLog(_ message: String, level: String = "INFO") {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(fmt.string(from: Date()))] [\(level)] \(message)\n"
+        logQueue.async { self.logFileHandle?.write(line.data(using: .utf8) ?? Data()) }
+    }
+
     private func run(initialMessages: [[String: Any]]? = nil) async {
+        agentLog("[bg] task: \(task)")
         do {
-            let (summary, messages) = try await client.runBackgroundTask(task, initialMessages: initialMessages) { [weak self] name, input in
+            let currentScratchpad = await MainActor.run { self.scratchpad }
+            let (summary, messages) = try await client.runBackgroundTask(task, initialMessages: initialMessages, initialScratchpad: currentScratchpad) { [weak self] name, input in
                 guard let self else { return "cancelled" }
                 return try await self.executeTool(name: name, input: input)
             } onStep: { [weak self] step in
                 guard let self else { return }
                 Task { @MainActor [weak self] in self?.onStatusUpdate?(step) }
+            } onScratchpadUpdate: { [weak self] updated in
+                guard let self else { return }
+                Task { @MainActor [weak self] in self?.scratchpad = updated }
+            } log: { [weak self] msg, level in
+                self?.agentLog(msg, level: level)
             }
             await MainActor.run { self.conversationMessages = messages }
             notify(title: "Cue: Done", body: summary)

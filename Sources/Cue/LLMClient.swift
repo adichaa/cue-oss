@@ -169,13 +169,19 @@ Any other action is invalid this turn.
     func runBackgroundTask(
         _ task: String,
         initialMessages: [[String: Any]]? = nil,
+        initialScratchpad: String = "",
         executeTool: @escaping (String, [String: Any]) async throws -> String,
-        onStep: @escaping (String) -> Void
+        onStep: @escaping (String) -> Void,
+        onScratchpadUpdate: @escaping (String) -> Void = { _ in },
+        log: @escaping (String, String) -> Void = { msg, level in CueLogger.write(msg, level: level) }
     ) async throws -> (summary: String, messages: [[String: Any]]) {
         let system = """
 You are a headless macOS automation agent. Complete the given task using only the provided tools.
 Think step by step, execute actions, and call complete_task when done.
-Browser guidance: prefer background tabs and non-visible page manipulation. Avoid tab churn, focus stealing, and page flashes during intermediate steps. Only surface windows to the user when the task truly requires it — do it late and intentionally, not during every intermediate step.
+Scratchpad: use update_scratchpad aggressively to record everything you learn — file paths, URLs, app state, what you've completed, what's next. Your scratchpad persists across context compression. Write to it after every meaningful discovery or completed step so you never have to re-discover things.
+Opening apps: many desktop apps register a custom URL scheme. When you have a web URL and want to open it in the corresponding desktop app, try replacing `https://` with `<hostname>://` and run `open "<scheme-url>"`. If it fails or does nothing, fall back to `open -a AppName` + AppleScript navigation.
+Typing into native apps: never use AppleScript keystroke to type message text — it garbles special characters, emojis, and symbols. Instead, write the text to the clipboard with run_shell (`printf '%s' "your message" | pbcopy`) then paste with AppleScript (`keystroke "v" using command down`).
+Browser guidance: browser_* tools control a headless Chromium instance — use them only for websites and web URLs. Never use browser_click or browser_type to interact with native macOS apps — those are not web pages and browser selectors will always time out. For native apps, use run_shell with osascript (AppleScript/System Events keystrokes) or read_app_ui to read their UI tree. Prefer background tabs and non-visible page manipulation. Avoid tab churn, focus stealing, and page flashes during intermediate steps. Only surface windows to the user when the task truly requires it — do it late and intentionally, not during every intermediate step.
 Screenshot guidance: take_screenshot is expensive — use it sparingly and only when you genuinely need to verify a visual state change (e.g. after clicking something, to confirm a dialog appeared). Never use it as a polling loop. Prefer run_shell or read_app_ui to check state whenever possible.
 Claude Code: the `claude` CLI may be available on this system. To use it, first find it with `which claude || find ~ -name claude -type f 2>/dev/null | head -1`, then run it as `<path> -p "your prompt here" --allowedTools "Write,Edit,Bash"` (the flag pre-approves file writes so it never prompts). Useful for delegating coding tasks or having Claude implement something in the current working directory.
 Tool installation: you can install missing CLI tools via `brew install <tool>` or `npm install -g <tool>`. If a command is not found, try installing it rather than giving up.
@@ -190,20 +196,24 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
             ["name": "browser_content", "description": "Get current page URL, title, and visible text from the headless browser.",          "input_schema": noInput],
             ["name": "read_app_ui",     "description": "Read the UI element tree of any running macOS app via Accessibility API. Returns buttons, labels, text, values — works on Spotify, Finder, any native app.",
              "input_schema": ["type": "object", "properties": ["app_name": ["type": "string"]], "required": ["app_name"]] as [String: Any]],
-            ["name": "take_screenshot",  "description": "Capture the current screen as an image. Use this to see what's on screen — UI state, app windows, dialogs, etc.",  "input_schema": noInput],
+            // ["name": "take_screenshot",  "description": "Capture the current screen as an image. Use this to see what's on screen — UI state, app windows, dialogs, etc.",  "input_schema": noInput],
             ["name": "complete_task",   "description": "Mark the task as complete. 'summary' is a one-sentence description of what was done. 'output' is the actual content to display to the user — use this when the task asked you to show, list, generate, or produce something (e.g. a list of numbers, a piece of text, search results). Leave 'output' empty for action-only tasks (opening apps, sending messages, etc).",   "input_schema": ["type": "object", "properties": ["summary": ["type": "string"], "output": ["type": "string"]], "required": ["summary"]] as [String: Any]],
             ["name": "start_agent",     "description": "Spawn a sub-agent to complete a well-defined subtask autonomously. Blocks until the sub-agent finishes and returns its summary and output. Use this to delegate parallel work or a self-contained chunk of the overall task.",
              "input_schema": ["type": "object", "properties": ["task": ["type": "string", "description": "Full description of the subtask for the sub-agent to complete."]], "required": ["task"]] as [String: Any]],
+            ["name": "update_scratchpad", "description": "Overwrite your persistent scratchpad with new content. Use this to record file paths, URLs, app state, completed steps, and what's next. The scratchpad survives context compression — update it after every meaningful discovery or completed step.",
+             "input_schema": ["type": "object", "properties": ["content": ["type": "string", "description": "Full new scratchpad content. Replaces the previous version entirely."]], "required": ["content"]] as [String: Any]],
         ]
 
         var messages: [[String: Any]] = initialMessages ?? [["role": "user", "content": "Task: \(task)"]]
+        var scratchpad = initialScratchpad
 
         var iteration = 0
         while true {
             iteration += 1
-            CueLogger.write("[bg] iteration \(iteration), msgs=\(messages.count)")
+            log("[bg] iteration \(iteration), msgs=\(messages.count)", "INFO")
+            let systemWithScratchpad = scratchpad.isEmpty ? system : "\(system)\n\nYour current scratchpad:\n\(scratchpad)"
             let blocks = try await completeWithTools(
-                messages: messages, system: system, maxTokens: 4096,
+                messages: messages, system: systemWithScratchpad, maxTokens: 4096,
                 model: Self.visionModel, tools: tools, beta: nil, toolChoice: "any"
             )
 
@@ -218,10 +228,15 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                       let name  = block["name"]  as? String,
                       let input = block["input"] as? [String: Any] else { continue }
 
-                if name == "complete_task" {
+                if name == "update_scratchpad" {
+                    scratchpad = input["content"] as? String ?? ""
+                    log("[bg] scratchpad updated (\(scratchpad.count) chars)", "INFO")
+                    onScratchpadUpdate(scratchpad)
+                    toolResults.append(["type": "tool_result", "tool_use_id": id, "content": "Scratchpad updated."])
+                } else if name == "complete_task" {
                     let summary = input["summary"] as? String ?? "Done."
                     let output  = input["output"]  as? String ?? ""
-                    CueLogger.write("[bg] complete_task: summary=\(summary.prefix(100)) output_len=\(output.count)")
+                    log("[bg] complete_task: summary=\(summary.prefix(100)) output_len=\(output.count)", "INFO")
                     let outputThreshold = 400
                     if !output.isEmpty && output.count > outputThreshold {
                         let ts = Int(Date().timeIntervalSince1970)
@@ -230,7 +245,7 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                         let fileURL = outputDir.appendingPathComponent("cue_output_\(ts).txt")
                         try? output.write(to: fileURL, atomically: true, encoding: .utf8)
                         NSWorkspace.shared.open(fileURL)
-                        CueLogger.write("[bg] output written to \(fileURL.path)")
+                        log("[bg] output written to \(fileURL.path)", "INFO")
                         completeSummary = "\(summary)\n\nOutput written to: /tmp/cue_output_\(ts).txt"
                     } else {
                         completeSummary = output.isEmpty ? summary : "\(summary)\n\n\(output)"
@@ -238,25 +253,25 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                     toolResults.append(["type": "tool_result", "tool_use_id": id, "content": summary])
                 } else if name == "take_screenshot" {
                     onStep("Taking screenshot")
-                    CueLogger.write("[bg] → Taking screenshot")
+                    log("[bg] → Taking screenshot", "INFO")
                     do {
                         let (data, _) = try await ScreenCapture.capture()
-                        CueLogger.write("[bg] ← screenshot \(data.count) bytes")
+                        log("[bg] ← screenshot \(data.count) bytes", "INFO")
                         toolResults.append(["type": "tool_result", "tool_use_id": id, "content": [
                             ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": data.base64EncodedString()]]
                         ]])
                     } catch {
-                        CueLogger.write("[bg] ← screenshot failed: \(error)")
+                        log("[bg] ← screenshot failed: \(error)", "WARN")
                         toolResults.append(["type": "tool_result", "tool_use_id": id, "content": "Screenshot failed: \(error.localizedDescription)"])
                     }
                 } else {
                     let desc = Self.bgStepDescription(name: name, input: input)
                     onStep(desc)
-                    CueLogger.write("[bg] → \(desc)")
+                    log("[bg] → \(desc)", "INFO")
                     let result: String
                     do { result = try await executeTool(name, input) }
                     catch { result = "Error: \(error.localizedDescription)" }
-                    CueLogger.write("[bg] ← \(result.prefix(300))")
+                    log("[bg] ← \(result.prefix(300))", "INFO")
                     toolResults.append(["type": "tool_result", "tool_use_id": id, "content": result])
                 }
             }
@@ -267,16 +282,16 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                 return (summary, messages)
             }
             guard !toolResults.isEmpty else {
-                CueLogger.write("[bg] no tool results — stopping", level: "WARN")
+                log("[bg] no tool results — stopping", "WARN")
                 break
             }
             messages.append(["role": "user", "content": toolResults])
 
-            // Compress when estimated token count exceeds ~60k tokens (≈240k chars)
-            if estimatedChars(messages) > 240_000 {
+            // Compress when estimated token count exceeds ~150k tokens (≈600k chars)
+            if estimatedChars(messages) > 600_000 {
                 let before = estimatedChars(messages)
                 messages = try await compressBgHistory(messages, task: task)
-                CueLogger.write("[bg] context compressed \(before/1000)k→\(estimatedChars(messages)/1000)k chars, \(messages.count) msgs")
+                log("[bg] context compressed \(before/1000)k→\(estimatedChars(messages)/1000)k chars, \(messages.count) msgs", "INFO")
             }
         }
         return ("Stopped after maximum steps.", messages)
@@ -287,7 +302,7 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
     }
 
     private func compressBgHistory(_ messages: [[String: Any]], task: String) async throws -> [[String: Any]] {
-        let keep = 4 // keep last N messages verbatim
+        let keep = 10 // keep last N messages verbatim
         guard messages.count > keep + 1 else { return messages }
         let toCompress = messages.dropFirst().dropLast(keep) // drop task msg + keep tail
         var historyText = ""
@@ -301,10 +316,10 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                 historyText += "[\(role)]: tools=\(names) \(texts)\n"
             }
         }
-        let prompt = "Summarize what this agent has done so far as a tight bullet list (max 12 bullets, each ≤20 words). Focus on: what was tried, what worked, what failed, current state, and what still needs to be done to complete the task. IMPORTANT: always preserve the final goal of the task in your summary.\n\nTask: \(task)\n\nHistory:\n\(historyText)"
+        let prompt = "Summarize what this agent has done so far as a bullet list. Focus on: what was tried, what worked, what failed, current state, and what still needs to be done. Be specific — include file paths, URLs, app names, usernames, and any concrete values discovered. IMPORTANT: always preserve the final goal of the task in your summary.\n\nTask: \(task)\n\nHistory:\n\(historyText)"
         let compressed = try await completeRaw(
             messages: [["role": "user", "content": prompt]],
-            system: nil, maxTokens: 400, model: Self.fastModel, tools: nil, beta: nil
+            system: nil, maxTokens: 800, model: Self.visionModel, tools: nil, beta: nil
         )
         let taskMsg = messages[0]
         let tail = Array(messages.suffix(keep))
