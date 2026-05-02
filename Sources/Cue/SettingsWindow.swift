@@ -11,6 +11,7 @@ final class SettingsWindowController {
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(nil)
     }
 
     private func makeWindow() -> NSWindow {

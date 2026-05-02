@@ -320,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default:
                 await ActionExecutor.execute(action, targetPid: resolvedPid)
             }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: 900_000_000)
             self?.taskController.submit("")
         }
     }

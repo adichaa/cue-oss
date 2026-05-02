@@ -85,13 +85,24 @@ struct SystemInfo {
         let bundleID = app.bundleIdentifier ?? ""
         let title = windowTitle(pid: app.processIdentifier) ?? name
         let (tabs, windows) = appCapabilities(bundleID: bundleID)
+        let browserBundleIDs: Set<String> = [
+            "com.apple.Safari", "com.apple.SafariTechnologyPreview",
+            "com.google.Chrome", "company.thebrowser.Browser",
+            "com.brave.Browser", "com.microsoft.edgemac", "org.mozilla.firefox",
+        ]
+        let preserve: Bool
+        if browserBundleIDs.contains(bundleID) {
+            preserve = browserURL().hasPrefix("http")
+        } else {
+            preserve = true
+        }
         return """
         <current_context>
         active_app: \(name)
         window_title: \(title)
         app_supports_tabs: \(tabs)
         app_supports_windows: \(windows)
-        preserve: true
+        preserve: \(preserve)
         </current_context>
         """
     }
