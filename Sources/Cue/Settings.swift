@@ -12,7 +12,14 @@ final class Settings: ObservableObject {
     static let defaultEndpoint = "https://api.anthropic.com"
 
     @Published var endpoint: String {
-        didSet { UserDefaults.standard.set(endpoint, forKey: Self.endpointKey) }
+        didSet {
+            let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed != endpoint { endpoint = trimmed; return }
+            guard URL(string: trimmed)?.scheme?.hasPrefix("http") == true else {
+                endpoint = Self.defaultEndpoint; return
+            }
+            UserDefaults.standard.set(trimmed, forKey: Self.endpointKey)
+        }
     }
 
     /// Mirrored in Keychain. Assign to update both.
@@ -30,7 +37,9 @@ final class Settings: ObservableObject {
 
     private init() {
         let defaults = UserDefaults.standard
-        self.endpoint = defaults.string(forKey: Self.endpointKey) ?? Self.defaultEndpoint
+        let saved = defaults.string(forKey: Self.endpointKey) ?? Self.defaultEndpoint
+        let validEndpoint = URL(string: saved)?.scheme?.hasPrefix("http") == true ? saved : Self.defaultEndpoint
+        self.endpoint = validEndpoint
         self.apiKey = Keychain.read(account: Self.apiKeyAccount) ?? ""
     }
 

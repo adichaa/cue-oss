@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var backgroundAgents: [BackgroundAgent] = []
     private static let maxAgents = 10
     private var activeReplyAgent: BackgroundAgent?
+    private var enterMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         CueLogger.setup()
@@ -94,12 +95,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         overlay.onSubmit = { [weak self] text in
-            guard let self, !text.isEmpty else { return }
+            guard let self else { return }
             if let agent = self.activeReplyAgent, !self.overlay.state.bgReplyTitle.isEmpty {
+                guard !text.isEmpty else { return }
                 agent.resume(message: text)
                 self.clearReplyContext()
                 self.overlay.orderOut(nil)
             } else if self.overlay.state.backgroundMode && self.overlay.state.phase == .empty {
+                guard !text.isEmpty else { return }
                 self.startBackgroundTask(text)
                 self.overlay.orderOut(nil)
             } else {
@@ -124,7 +127,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.taskController.cancel()
             self?.indicator.dismiss()
             self?.approvalManager.reset()
+            self?.removeEnterMonitor()
         }
+
+        overlay.state.$phase
+            .receive(on: RunLoop.main)
+            .sink { [weak self] phase in
+                if phase == .active {
+                    self?.installEnterMonitor()
+                } else {
+                    self?.removeEnterMonitor()
+                }
+            }
+            .store(in: &cancellables)
 
         // Show/update indicator and handle auto-mode execution.
         overlay.state.$pendingAction
@@ -471,6 +486,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.title = running.isEmpty ? "cue" : "cue (\(running.count))"
         }
+    }
+
+    // MARK: - Global Enter intercept (coach mode next-step)
+
+    private func installEnterMonitor() {
+        guard enterMonitor == nil else { return }
+        enterMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return }
+            // kVK_Return = 36, kVK_ANSI_KeypadEnter = 76
+            guard event.keyCode == 36 || event.keyCode == 76 else { return }
+            guard event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return }
+            guard self.overlay.isVisible,
+                  self.overlay.state.phase == .active,
+                  self.overlay.state.text.isEmpty,
+                  !self.overlay.state.awaitingApproval else { return }
+            Task { @MainActor [weak self] in
+                self?.taskController.submit("")
+            }
+        }
+    }
+
+    private func removeEnterMonitor() {
+        if let m = enterMonitor { NSEvent.removeMonitor(m) }
+        enterMonitor = nil
     }
 
 }
