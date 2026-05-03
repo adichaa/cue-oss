@@ -5,7 +5,9 @@ let page = null;
 
 async function getPage() {
   if (!browser) {
-    const { chromium } = require('playwright');
+    const { chromium } = require('playwright-extra');
+    const stealth = require('puppeteer-extra-plugin-stealth');
+    chromium.use(stealth());
     browser = await chromium.launch({ headless: true });
     const ctx = await browser.newContext();
     page = await ctx.newPage();

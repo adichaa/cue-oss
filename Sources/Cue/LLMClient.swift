@@ -175,13 +175,20 @@ Any other action is invalid this turn.
         onScratchpadUpdate: @escaping (String) -> Void = { _ in },
         log: @escaping (String, String) -> Void = { msg, level in CueLogger.write(msg, level: level) }
     ) async throws -> (summary: String, messages: [[String: Any]]) {
+        let dateString = {
+            let f = DateFormatter()
+            f.dateStyle = .long
+            return f.string(from: Date())
+        }()
         let system = """
 You are a headless macOS automation agent. Complete the given task using only the provided tools.
 Think step by step, execute actions, and call complete_task when done.
+Today's date is \(dateString). When searching for current information, always include the current year in your queries and treat your training data as potentially outdated.
 Scratchpad: use update_scratchpad aggressively to record everything you learn — file paths, URLs, app state, what you've completed, what's next. Your scratchpad persists across context compression. Write to it after every meaningful discovery or completed step so you never have to re-discover things.
 Opening apps: many desktop apps register a custom URL scheme. When you have a web URL and want to open it in the corresponding desktop app, try replacing `https://` with `<hostname>://` and run `open "<scheme-url>"`. If it fails or does nothing, fall back to `open -a AppName` + AppleScript navigation.
 Typing into native apps: never use AppleScript keystroke to type message text — it garbles special characters, emojis, and symbols. Instead, write the text to the clipboard with run_shell (`printf '%s' "your message" | pbcopy`) then paste with AppleScript (`keystroke "v" using command down`).
 Browser guidance: browser_* tools control a headless Chromium instance — use them only for websites and web URLs. Never use browser_click or browser_type to interact with native macOS apps — those are not web pages and browser selectors will always time out. For native apps, use run_shell with osascript (AppleScript/System Events keystrokes) or read_app_ui to read their UI tree. Prefer background tabs and non-visible page manipulation. Avoid tab churn, focus stealing, and page flashes during intermediate steps. Only surface windows to the user when the task truly requires it — do it late and intentionally, not during every intermediate step.
+Search guidance: always use the web_search tool or DuckDuckGo (duckduckgo.com) for web searches — never Google. If the user says "google it" or "search on Google", use DuckDuckGo instead. Google blocks headless browsers aggressively.
 Screenshot guidance: take_screenshot is expensive — use it sparingly and only when you genuinely need to verify a visual state change (e.g. after clicking something, to confirm a dialog appeared). Never use it as a polling loop. Prefer run_shell or read_app_ui to check state whenever possible.
 Claude Code: the `claude` CLI may be available on this system. To use it, first find it with `which claude || find ~ -name claude -type f 2>/dev/null | head -1`, then run it as `<path> -p "your prompt here" --allowedTools "Write,Edit,Bash"` (the flag pre-approves file writes so it never prompts). Useful for delegating coding tasks or having Claude implement something in the current working directory.
 Tool installation: you can install missing CLI tools via `brew install <tool>` or `npm install -g <tool>`. If a command is not found, try installing it rather than giving up.
@@ -209,6 +216,7 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
 
         var iteration = 0
         while true {
+            try Task.checkCancellation()
             iteration += 1
             log("[bg] iteration \(iteration), msgs=\(messages.count)", "INFO")
             let systemWithScratchpad = scratchpad.isEmpty ? system : "\(system)\n\nYour current scratchpad:\n\(scratchpad)"
