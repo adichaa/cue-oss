@@ -33,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastFrontApp: String = ""
     private let approvalManager = ApprovalManager()
     private var backgroundAgents: [BackgroundAgent] = []
-    private static let maxAgents = 10
+    private static let maxAgents = 25
     private var activeReplyAgent: BackgroundAgent?
     private var enterMonitor: Any?
 
@@ -421,13 +421,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
-    private func startBackgroundTask(_ task: String) -> String {
+    private func startBackgroundTask(_ task: String, model: String? = nil, toolsMode: [String]? = nil, isSubAgent: Bool = false) -> String {
         guard backgroundAgents.filter({ $0.isRunning }).count < Self.maxAgents else {
             CueLogger.write("[bg] agent limit reached (\(Self.maxAgents)) — ignoring: \(task.prefix(80))", level: "WARN")
             return ""
         }
-        CueLogger.write("[bg] task: \(task)")
-        let agent = BackgroundAgent(task: task, settings: Settings.shared)
+        // Parse [TOOLS:tool1,tool2,...] prefix to restrict tool set
+        var resolvedTask = task
+        var resolvedToolsMode = toolsMode
+        if task.hasPrefix("[TOOLS:"), let end = task.firstIndex(of: "]") {
+            let toolList = String(task[task.index(task.startIndex, offsetBy: 7)..<end])
+            resolvedToolsMode = toolList.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            resolvedTask = String(task[task.index(after: end)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        CueLogger.write("[bg] task: \(resolvedTask)")
+        let resolvedModel: String? = {
+            switch model {
+            case "haiku":  return AnthropicClient.haikuModelID
+            case "sonnet": return AnthropicClient.sonnetModelID
+            default:       return nil
+            }
+        }()
+        let agent = BackgroundAgent(task: resolvedTask, settings: Settings.shared, model: resolvedModel, toolsMode: resolvedToolsMode, isSubAgent: isSubAgent)
 
         let companion = TaskHUD()
         companion.present(title: task, message: "Starting…")
@@ -444,10 +459,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let markerURL = outputDir.appendingPathComponent("agent_\(agent.id)_done.json")
                 try? JSONSerialization.data(withJSONObject: marker).write(to: markerURL)
             }
-            companion.complete(message: summary, onReply: { [weak self, weak agent] in
-                guard let self, let agent else { return }
-                self.enterReplyMode(agent: agent, title: task)
-            })
+            if isSubAgent {
+                companion.dismiss()
+                self?.backgroundAgents.removeAll { $0.id == agent?.id }
+            } else {
+                companion.complete(message: summary, onReply: { [weak self, weak agent] in
+                    guard let self, let agent else { return }
+                    self.enterReplyMode(agent: agent, title: task)
+                })
+            }
             self?.updateBackgroundMenu()
         }
         agent.onResume = {
@@ -458,8 +478,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             companion.fail(message: error)
             self?.updateBackgroundMenu()
         }
-        agent.onSpawnAgent = { [weak self] subtask in
-            await MainActor.run { self?.startBackgroundTask(subtask) ?? "" }
+        agent.onSpawnAgent = { [weak self] subtask, submodel, subtools in
+            await MainActor.run { self?.startBackgroundTask(subtask, model: submodel, toolsMode: subtools, isSubAgent: true) ?? "" }
         }
         backgroundAgents.append(agent)
         agent.start()
@@ -479,6 +499,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func clearReplyContext() {
         activeReplyAgent = nil
         overlay.state.bgReplyTitle = ""
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        for agent in backgroundAgents {
+            agent.cancel()
+            agent.killSidecar()
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        proc.arguments = ["-9", "-f", "chrome-headless-shell"]
+        try? proc.run()
+        proc.waitUntilExit()
     }
 
     private func updateBackgroundMenu() {

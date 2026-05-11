@@ -37,8 +37,17 @@ struct AnthropicClient {
     let apiKey: String
 
     // Vision tasks (screenshots) use Sonnet; text-only tasks use Haiku.
-    private static let visionModel = "claude-sonnet-4-5"
-    private static let fastModel   = "claude-haiku-4-5-20251001"
+    static let sonnetModelID = "claude-sonnet-4-6"
+    static let haikuModelID  = "claude-haiku-4-5-20251001"
+    private static let visionModel = sonnetModelID
+    private static let fastModel   = haikuModelID
+
+    private static let urlSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 180
+        config.timeoutIntervalForResource = 300
+        return URLSession(configuration: config)
+    }()
 
     @MainActor
     init(settings: Settings) {
@@ -168,11 +177,15 @@ Any other action is invalid this turn.
 
     func runBackgroundTask(
         _ task: String,
+        model: String? = nil,
+        toolsMode: [String]? = nil,
         initialMessages: [[String: Any]]? = nil,
         initialScratchpad: String = "",
+        isSubAgent: Bool = false,
         executeTool: @escaping (String, [String: Any]) async throws -> String,
         onStep: @escaping (String) -> Void,
         onScratchpadUpdate: @escaping (String) -> Void = { _ in },
+        onMessagesUpdate: @escaping ([[String: Any]]) -> Void = { _ in },
         log: @escaping (String, String) -> Void = { msg, level in CueLogger.write(msg, level: level) }
     ) async throws -> (summary: String, messages: [[String: Any]]) {
         let dateString = {
@@ -193,9 +206,10 @@ Screenshot guidance: take_screenshot is expensive — use it sparingly and only 
 Claude Code: the `claude` CLI may be available on this system. To use it, first find it with `which claude || find ~ -name claude -type f 2>/dev/null | head -1`, then run it as `<path> -p "your prompt here" --allowedTools "Write,Edit,Bash"` (the flag pre-approves file writes so it never prompts). Useful for delegating coding tasks or having Claude implement something in the current working directory.
 Tool installation: you can install missing CLI tools via `brew install <tool>` or `npm install -g <tool>`. If a command is not found, try installing it rather than giving up.
 Agent coordination: when you spawn a child agent with start_agent, it runs independently. When a child finishes, it writes a JSON marker to ~/.cue/output/agent_{id}_done.json containing its id, task, summary, and completedAt. The start_agent tool returns the child's id immediately. To wait for a child, poll for its marker file with run_shell: `ls ~/.cue/output/agent_{id}_done.json 2>/dev/null`. To read its result: `cat ~/.cue/output/agent_{id}_done.json`.
+Model selection: always set the `model` parameter explicitly when calling start_agent. Use "haiku" for simple, single-goal tasks (fetch a page, find an email, run a command, look something up). Use "sonnet" for complex tasks that require multi-step reasoning, error recovery, or judgment calls. When in doubt, use "haiku" — it is much cheaper and fast enough for most subtasks. Example: start_agent(task="...", model="haiku").
 """
         let noInput: [String: Any] = ["type": "object", "properties": [:] as [String: Any], "required": [] as [String]]
-        let tools: [[String: Any]] = [
+        let allTools: [[String: Any]] = [
             ["name": "run_shell",       "description": "Run a shell command via /bin/zsh. Returns stdout and stderr.",                    "input_schema": ["type": "object", "properties": ["command":  ["type": "string"]], "required": ["command"]]  as [String: Any]],
             ["name": "browser_navigate","description": "Navigate the headless browser to a URL.",                                          "input_schema": ["type": "object", "properties": ["url":      ["type": "string"]], "required": ["url"]]      as [String: Any]],
             ["name": "browser_click",   "description": "Click an element in the headless browser by CSS selector.",                        "input_schema": ["type": "object", "properties": ["selector": ["type": "string"]], "required": ["selector"]] as [String: Any]],
@@ -206,10 +220,11 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
             ["name": "take_screenshot",  "description": "Capture the current screen as an image. Use this to see what's on screen — UI state, app windows, dialogs, etc.",  "input_schema": noInput],
             ["name": "complete_task",   "description": "Mark the task as complete. 'summary' is a one-sentence description of what was done. 'output' is the actual content to display to the user — use this when the task asked you to show, list, generate, or produce something (e.g. a list of numbers, a piece of text, search results). Leave 'output' empty for action-only tasks (opening apps, sending messages, etc).",   "input_schema": ["type": "object", "properties": ["summary": ["type": "string"], "output": ["type": "string"]], "required": ["summary"]] as [String: Any]],
             ["name": "start_agent",     "description": "Spawn a sub-agent to complete a well-defined subtask autonomously. Blocks until the sub-agent finishes and returns its summary and output. Use this to delegate parallel work or a self-contained chunk of the overall task.",
-             "input_schema": ["type": "object", "properties": ["task": ["type": "string", "description": "Full description of the subtask for the sub-agent to complete."]], "required": ["task"]] as [String: Any]],
+             "input_schema": ["type": "object", "properties": ["task": ["type": "string", "description": "Full description of the subtask for the sub-agent to complete."], "model": ["type": "string", "enum": ["haiku", "sonnet"], "description": "Model to use. haiku: fast and cheap, for simple single-goal tasks. sonnet: smarter, for complex multi-step tasks. Default: sonnet."], "tools": ["type": "array", "items": ["type": "string"], "description": "Optional list of tool names to give the sub-agent. Omit to give all tools. Example: [\"run_shell\",\"start_agent\",\"complete_task\",\"update_scratchpad\"]"]], "required": ["task"]] as [String: Any]],
             ["name": "update_scratchpad", "description": "Overwrite your persistent scratchpad with new content. Use this to record file paths, URLs, app state, completed steps, and what's next. The scratchpad survives context compression — update it after every meaningful discovery or completed step.",
              "input_schema": ["type": "object", "properties": ["content": ["type": "string", "description": "Full new scratchpad content. Replaces the previous version entirely."]], "required": ["content"]] as [String: Any]],
         ]
+        let tools = toolsMode.map { allowed in allTools.filter { allowed.contains($0["name"] as? String ?? "") } } ?? allTools
 
         var messages: [[String: Any]] = initialMessages ?? [["role": "user", "content": "Task: \(task)"]]
         var scratchpad = initialScratchpad
@@ -220,10 +235,21 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
             iteration += 1
             log("[bg] iteration \(iteration), msgs=\(messages.count)", "INFO")
             let systemWithScratchpad = scratchpad.isEmpty ? system : "\(system)\n\nYour current scratchpad:\n\(scratchpad)"
-            let blocks = try await completeWithTools(
-                messages: messages, system: systemWithScratchpad, maxTokens: 4096,
-                model: Self.visionModel, tools: tools, beta: nil, toolChoice: "any"
-            )
+            let blocks = try await withThrowingTaskGroup(of: [[String: Any]].self) { group in
+                group.addTask {
+                    try await self.completeWithTools(
+                        messages: messages, system: systemWithScratchpad, maxTokens: 8192,
+                        model: model ?? Self.visionModel, tools: tools, beta: nil, toolChoice: "any"
+                    )
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 150_000_000_000) // 150s hard deadline
+                    throw URLError(.timedOut)
+                }
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
 
             var assistantContent: [[String: Any]] = []
             var toolResults: [[String: Any]] = []
@@ -252,7 +278,7 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
                         let fileURL = outputDir.appendingPathComponent("cue_output_\(ts).txt")
                         try? output.write(to: fileURL, atomically: true, encoding: .utf8)
-                        NSWorkspace.shared.open(fileURL)
+                        if !isSubAgent { NSWorkspace.shared.open(fileURL) }
                         log("[bg] output written to \(fileURL.path)", "INFO")
                         completeSummary = "\(summary)\n\nOutput written to: /tmp/cue_output_\(ts).txt"
                     } else {
@@ -294,11 +320,16 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                 break
             }
             messages.append(["role": "user", "content": toolResults])
+            onMessagesUpdate(messages)
 
-            // Compress when estimated token count exceeds ~150k tokens (≈600k chars)
-            if estimatedChars(messages) > 600_000 {
+            if messages.count > 20 {
                 let before = estimatedChars(messages)
-                messages = try await compressBgHistory(messages, task: task)
+                let (compressed, newScratchpad) = try await compressBgHistory(messages, task: task, scratchpad: scratchpad)
+                messages = compressed
+                if !newScratchpad.isEmpty {
+                    scratchpad = newScratchpad
+                    onScratchpadUpdate(scratchpad)
+                }
                 log("[bg] context compressed \(before/1000)k→\(estimatedChars(messages)/1000)k chars, \(messages.count) msgs", "INFO")
             }
         }
@@ -309,10 +340,10 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
         (try? JSONSerialization.data(withJSONObject: messages))?.count ?? 0
     }
 
-    private func compressBgHistory(_ messages: [[String: Any]], task: String) async throws -> [[String: Any]] {
-        let keep = 10 // keep last N messages verbatim
-        guard messages.count > keep + 1 else { return messages }
-        let toCompress = messages.dropFirst().dropLast(keep) // drop task msg + keep tail
+    func compressBgHistory(_ messages: [[String: Any]], task: String, scratchpad: String) async throws -> ([[String: Any]], String) {
+        let keep = 4 // keep last N messages verbatim
+        guard messages.count > keep + 1 else { return (messages, scratchpad) }
+        let toCompress = messages.dropFirst().dropLast(keep)
         var historyText = ""
         for msg in toCompress {
             let role = msg["role"] as? String ?? "?"
@@ -324,14 +355,49 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
                 historyText += "[\(role)]: tools=\(names) \(texts)\n"
             }
         }
-        let prompt = "Summarize what this agent has done so far as a bullet list. Focus on: what was tried, what worked, what failed, current state, and what still needs to be done. Be specific — include file paths, URLs, app names, usernames, and any concrete values discovered. IMPORTANT: always preserve the final goal of the task in your summary.\n\nTask: \(task)\n\nHistory:\n\(historyText)"
-        let compressed = try await completeRaw(
+        let prompt = """
+        An agent is working on this task:
+        \(task)
+
+        Current scratchpad:
+        \(scratchpad.isEmpty ? "(empty)" : scratchpad)
+
+        Conversation history to compress:
+        \(historyText)
+
+        Produce two sections in this exact order — SCRATCHPAD first, then SUMMARY:
+
+        SCRATCHPAD:
+        Imagine a fresh instance of this agent that has the task description above but NO conversation history at all. Write a scratchpad that lets it resume with zero loss. It must contain everything that cannot be re-derived from the task description alone:
+        - Exact progress point: what has been completed, what index or step is next
+        - Any in-flight work: agent IDs, process IDs, operations that were started and may not be done yet — list every ID in full
+        - Discovered values: credentials, tokens, IDs, URLs, config, paths found during the task
+        - Decisions already made that shouldn't be repeated: things tried and failed, choices locked in
+        - Next concrete action to take
+        If anything is missing, the fresh agent will have to redo work or fail. Be exhaustive. Never truncate IDs or lists.
+
+        SUMMARY:
+        A brief bullet list of what's been done — what worked, what failed, current state, what's next.
+        """
+        let response = try await completeRaw(
             messages: [["role": "user", "content": prompt]],
-            system: nil, maxTokens: 800, model: Self.visionModel, tools: nil, beta: nil
+            system: nil, maxTokens: 2000, model: Self.visionModel, tools: nil, beta: nil
         )
+        let summaryPart: String
+        let scratchpadPart: String
+        if let spIdx = response.range(of: "SCRATCHPAD:"), let sIdx = response.range(of: "SUMMARY:") {
+            scratchpadPart = String(response[spIdx.upperBound..<sIdx.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            summaryPart = String(response[sIdx.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if let spIdx = response.range(of: "SCRATCHPAD:") {
+            scratchpadPart = String(response[spIdx.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            summaryPart = ""
+        } else {
+            summaryPart = response
+            scratchpadPart = scratchpad
+        }
         let taskMsg = messages[0]
         let tail = Array(messages.suffix(keep))
-        return [taskMsg, ["role": "user", "content": "[Progress summary]\n\(compressed)"]] + tail
+        return ([taskMsg, ["role": "user", "content": "[Progress summary]\n\(summaryPart)"]] + tail, scratchpadPart)
     }
 
     // MARK: - Shared agentic loop
@@ -521,23 +587,33 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
         req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         if let beta { req.setValue(beta, forHTTPHeaderField: "anthropic-beta") }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        req.timeoutInterval = 120
+        req.timeoutInterval = 60
 
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw LLMError.decode("non-HTTP response")
+        var lastError: Error = LLMError.decode("no attempts")
+        for attempt in 0..<6 {
+            if attempt > 0 {
+                let delay = Double(min(60, 5 * (1 << (attempt - 1)))) // 5, 10, 20, 40, 60s
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            let (data, response) = try await Self.urlSession.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                throw LLMError.decode("non-HTTP response")
+            }
+            if http.statusCode == 429 || http.statusCode == 529 {
+                lastError = LLMError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+                continue
+            }
+            if http.statusCode >= 400 {
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                throw LLMError.http(status: http.statusCode, body: bodyStr)
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let contentArr = json["content"] as? [[String: Any]] else {
+                throw LLMError.decode("missing content array")
+            }
+            return contentArr
         }
-        if http.statusCode >= 400 {
-            let bodyStr = String(data: data, encoding: .utf8) ?? ""
-            throw LLMError.http(status: http.statusCode, body: bodyStr)
-        }
-
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let contentArr = json["content"] as? [[String: Any]] else {
-            throw LLMError.decode("missing content array")
-        }
-
-        return contentArr
+        throw lastError
     }
 
     private func completeRaw(
@@ -714,7 +790,7 @@ Agent coordination: when you spawn a child agent with start_agent, it runs indep
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 15
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, _) = try await Self.urlSession.data(for: req)
         guard let html = String(data: data, encoding: .utf8) else { return "Could not decode response." }
         let stripped = html
             .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)

@@ -14,14 +14,23 @@ final class BackgroundAgent {
     var onComplete: ((String) -> Void)?
     var onFailure: ((String) -> Void)?
     var onResume: (() -> Void)?
-    var onSpawnAgent: ((String) async -> String)?
+    var onSpawnAgent: ((String, String?, [String]?) async -> String)?
 
     private var conversationMessages: [[String: Any]] = []
     private var scratchpad: String = ""
     private var finished = false
+    private var activeProcesses: [Process] = []
+    private let processLock = NSLock()
 
-    @MainActor init(task: String, settings: Settings) {
+    let model: String?
+    let toolsMode: [String]?
+    let isSubAgent: Bool
+
+    @MainActor init(task: String, settings: Settings, model: String? = nil, toolsMode: [String]? = nil, isSubAgent: Bool = false) {
         self.task = task
+        self.model = model
+        self.toolsMode = toolsMode
+        self.isSubAgent = isSubAgent
         self.client = AnthropicClient(settings: settings)
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cue/logs")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -50,9 +59,31 @@ final class BackgroundAgent {
     @MainActor func cancel() {
         runTask?.cancel()
         Task.detached { [weak self] in await self?.sidecar.stop() }
+        processLock.lock()
+        let procs = activeProcesses
+        processLock.unlock()
+        for proc in procs {
+            proc.interrupt()
+            // kill the whole process group so children (chromium, node) die too
+            if proc.isRunning {
+                kill(-proc.processIdentifier, SIGKILL)
+            }
+        }
+        onFailure?("cancelled")
     }
 
     var isRunning: Bool { runTask != nil && !finished && runTask?.isCancelled == false }
+
+    func killSidecar() {
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached { [weak self] in
+            if let pid = await self?.sidecar.processGroupID {
+                kill(-pid, SIGKILL)
+            }
+            sem.signal()
+        }
+        sem.wait()
+    }
 
     // MARK: - Private
 
@@ -65,30 +96,65 @@ final class BackgroundAgent {
 
     private func run(initialMessages: [[String: Any]]? = nil) async {
         agentLog("[bg] task: \(task)")
-        do {
-            let currentScratchpad = await MainActor.run { self.scratchpad }
-            let (summary, messages) = try await client.runBackgroundTask(task, initialMessages: initialMessages, initialScratchpad: currentScratchpad) { [weak self] name, input in
-                guard let self else { return "cancelled" }
-                return try await self.executeTool(name: name, input: input)
-            } onStep: { [weak self] step in
-                guard let self else { return }
-                Task { @MainActor [weak self] in self?.onStatusUpdate?(step) }
-            } onScratchpadUpdate: { [weak self] updated in
-                guard let self else { return }
-                Task { @MainActor [weak self] in self?.scratchpad = updated }
-            } log: { [weak self] msg, level in
-                self?.agentLog(msg, level: level)
+        var attempts = 0
+        let maxRetries = 3
+        while true {
+            do {
+                let currentScratchpad = await MainActor.run { self.scratchpad }
+                let currentModel = await MainActor.run { self.model }
+                let currentToolsMode = await MainActor.run { self.toolsMode }
+                let currentMessages = await MainActor.run { self.conversationMessages }
+                let resumeMessages = currentMessages.isEmpty ? initialMessages : currentMessages
+                let (summary, messages) = try await client.runBackgroundTask(task, model: currentModel, toolsMode: currentToolsMode, initialMessages: resumeMessages, initialScratchpad: currentScratchpad, isSubAgent: isSubAgent) { [weak self] name, input in
+                    guard let self else { return "cancelled" }
+                    return try await self.executeTool(name: name, input: input)
+                } onStep: { [weak self] step in
+                    guard let self else { return }
+                    Task { @MainActor [weak self] in self?.onStatusUpdate?(step) }
+                } onScratchpadUpdate: { [weak self] updated in
+                    guard let self else { return }
+                    Task { @MainActor [weak self] in self?.scratchpad = updated }
+                } onMessagesUpdate: { [weak self] updated in
+                    guard let self else { return }
+                    Task { @MainActor [weak self] in self?.conversationMessages = updated }
+                } log: { [weak self] msg, level in
+                    self?.agentLog(msg, level: level)
+                }
+                await MainActor.run { self.conversationMessages = messages }
+                agentLog("[bg] done")
+                notify(title: "Cue: Done", body: summary)
+                let onComplete = await MainActor.run { self.onComplete }
+                onComplete?(summary)
+                break
+            } catch is CancellationError {
+                agentLog("[bg] cancelled")
+                break
+            } catch {
+                attempts += 1
+                if attempts <= maxRetries {
+                    let delay: UInt64 = UInt64(min(30, attempts * 5)) * 1_000_000_000
+                    agentLog("[bg] network error (attempt \(attempts)/\(maxRetries)), retrying in \(min(30, attempts * 5))s: \(error.localizedDescription)")
+                    // Force compression before retry so a bloated context doesn't cause the same timeout again
+                    let msgs = await MainActor.run { self.conversationMessages }
+                    let pad  = await MainActor.run { self.scratchpad }
+                    if !msgs.isEmpty {
+                        if let (compressed, newScratchpad) = try? await client.compressBgHistory(msgs, task: task, scratchpad: pad) {
+                            await MainActor.run {
+                                self.conversationMessages = compressed
+                                if !newScratchpad.isEmpty { self.scratchpad = newScratchpad }
+                            }
+                            agentLog("[bg] force-compressed before retry: \(msgs.count) msgs → \(compressed.count) msgs")
+                        }
+                    }
+                    try? await Task.sleep(nanoseconds: delay)
+                } else {
+                    agentLog("[bg] failed: \(error.localizedDescription)")
+                    notify(title: "Cue: Task failed", body: error.localizedDescription)
+                    let onFailure = await MainActor.run { self.onFailure }
+                    onFailure?(error.localizedDescription)
+                    break
+                }
             }
-            await MainActor.run { self.conversationMessages = messages }
-            notify(title: "Cue: Done", body: summary)
-            let onComplete = await MainActor.run { self.onComplete }
-            onComplete?(summary)
-        } catch is CancellationError {
-            // silently cancelled
-        } catch {
-            notify(title: "Cue: Task failed", body: error.localizedDescription)
-            let onFailure = await MainActor.run { self.onFailure }
-            onFailure?(error.localizedDescription)
         }
         await sidecar.stop()
         finished = true
@@ -123,9 +189,14 @@ final class BackgroundAgent {
             return SystemInfo.readAppUI(appName)
         case "start_agent":
             let subtask = input["task"] as? String ?? ""
+            let submodel = input["model"] as? String
+            let subtools = input["tools"] as? [String]
             let cb = await MainActor.run { onSpawnAgent }
             if let cb {
-                let id = await cb(subtask)
+                let id = await cb(subtask, submodel, subtools)
+                if id.isEmpty {
+                    return "ERROR: agent limit reached — too many agents running. Wait for existing agents to finish before spawning more."
+                }
                 return "Agent started. id=\(id) — poll: ls ~/.cue/output/agent_\(id)_done.json"
             }
             return "Agent started for: \(subtask)"
@@ -138,29 +209,40 @@ final class BackgroundAgent {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-c", command]
+        // run in its own process group so we can kill the whole tree
+        proc.qualityOfService = .utility
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError  = errPipe
+        processLock.lock()
+        activeProcesses.append(proc)
+        processLock.unlock()
+        defer {
+            processLock.lock()
+            activeProcesses.removeAll { $0 === proc }
+            processLock.unlock()
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
-                DispatchQueue.global(qos: .utility).async {
-                    do {
-                        try proc.run()
-                        proc.waitUntilExit()
-                        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                        let combined = [out, err].filter { !$0.isEmpty }
-                            .joined(separator: "\n")
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                        cont.resume(returning: combined.isEmpty ? "(exit \(proc.terminationStatus))" : combined)
-                    } catch {
-                        cont.resume(throwing: error)
-                    }
+                proc.terminationHandler = { p in
+                    let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    let combined = [out, err].filter { !$0.isEmpty }
+                        .joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    cont.resume(returning: combined.isEmpty ? "(exit \(p.terminationStatus))" : combined)
+                }
+                do {
+                    try proc.run()
+                    setpgid(proc.processIdentifier, proc.processIdentifier)
+                } catch {
+                    cont.resume(throwing: error)
                 }
             }
         } onCancel: {
-            proc.terminate()
+            proc.interrupt()
+            kill(-proc.processIdentifier, SIGKILL)
         }
     }
 

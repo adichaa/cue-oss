@@ -23,6 +23,8 @@ actor PlaywrightSidecar {
         proc.standardError  = FileHandle.nullDevice
 
         try proc.run()
+        // put in its own process group so stop() can kill the whole tree (node + chromium)
+        setpgid(proc.processIdentifier, proc.processIdentifier)
         process     = proc
         stdinHandle = stdinPipe.fileHandleForWriting
         started     = true
@@ -34,18 +36,44 @@ actor PlaywrightSidecar {
         }
     }
 
-    func send(_ command: [String: Any]) async throws -> [String: Any] {
+    func send(_ command: [String: Any], timeout: TimeInterval = 20) async throws -> [String: Any] {
         guard let data = try? JSONSerialization.data(withJSONObject: command),
               let line = String(data: data, encoding: .utf8) else {
             throw SidecarError.encodingFailed
         }
         stdinHandle?.write((line + "\n").data(using: .utf8) ?? Data())
-        return try await withCheckedThrowingContinuation { pendingContinuations.append($0) }
+        return try await withThrowingTaskGroup(of: [String: Any].self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { cont in
+                    Task { await self.appendContinuation(cont) }
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw SidecarError.timeout
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
+
+    private func appendContinuation(_ cont: CheckedContinuation<[String: Any], Error>) {
+        pendingContinuations.append(cont)
+    }
+
+    var processGroupID: pid_t? { process?.processIdentifier }
 
     func stop() {
         stdinHandle?.closeFile()
-        process?.terminate()
+        if let pid = process?.processIdentifier {
+            kill(pid, SIGTERM)
+            let deadline = Date().addingTimeInterval(3)
+            while process?.isRunning == true && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            kill(-pid, SIGKILL)
+        }
         process     = nil
         stdinHandle = nil
         started     = false
@@ -102,7 +130,7 @@ actor PlaywrightSidecar {
     }
 
     enum SidecarError: LocalizedError {
-        case nodeNotFound, scriptNotFound, encodingFailed, stopped
+        case nodeNotFound, scriptNotFound, encodingFailed, stopped, timeout
         case remote(String)
         var errorDescription: String? {
             switch self {
@@ -110,6 +138,7 @@ actor PlaywrightSidecar {
             case .scriptNotFound: return "Playwright sidecar script not found"
             case .encodingFailed: return "Failed to encode sidecar command"
             case .stopped:        return "Sidecar was stopped"
+            case .timeout:        return "Sidecar command timed out"
             case .remote(let m):  return "Sidecar: \(m)"
             }
         }
